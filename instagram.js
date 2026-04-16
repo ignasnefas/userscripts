@@ -291,10 +291,24 @@
         return true;
     }
 
+    function scrollIntoViewForInteraction(target) {
+        if (!target) return;
+        const article = target.closest('article') || target;
+        article.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' });
+        const rect = target.getBoundingClientRect();
+        if (rect.top < 0 || rect.bottom > window.innerHeight) {
+            window.scrollBy({
+                top: Math.round(rect.top - (window.innerHeight / 2) + (rect.height / 2)),
+                left: 0,
+                behavior: 'smooth'
+            });
+        }
+    }
+
     function safeClick(target) {
         if (!target) return false;
         try {
-            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            scrollIntoViewForInteraction(target);
             if (typeof target.click === 'function') {
                 target.click();
             } else {
@@ -448,7 +462,9 @@
 
     async function humanViewPost(post) {
         if (!settings.humanizeAutoLiker) return;
-        post.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        post.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' });
+        await new Promise(resolve => window.setTimeout(resolve, 100));
+        window.scrollBy({ top: -Math.round(window.innerHeight * 0.08), left: 0, behavior: 'smooth' });
         await new Promise(resolve => window.setTimeout(resolve, humanDelay(settings.humanViewMinDelay, settings.humanViewMaxDelay)));
     }
 
