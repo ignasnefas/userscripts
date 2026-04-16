@@ -472,7 +472,12 @@
         const avgLikeDelay = (settings.autoLikeMinDelay + settings.autoLikeMaxDelay) / 2;
         const avgAfterLikeDelay = 350;
         const avgBatchClicks = settings.autoLikeBatchSize * (1 - settings.autoLikeSkipPercent / 100);
-        const avgBatchTime = settings.autoLikeBatchSize * (avgLikeDelay + avgAfterLikeDelay) + settings.autoLikeScrollDelay + 700;
+        const avgPeekDelay = settings.humanPeekChance / 100 * ((700 + 1500) / 2 + 500);
+        const avgStoryDelay = settings.autoLikeOpenStories ? (3000 + 6000) / 2 + 900 : 0;
+        const avgPauseDelay = settings.humanizeAutoLiker && settings.humanPauseAfterLikes > 0
+            ? ((settings.humanPauseMinDelay + settings.humanPauseMaxDelay) / 2) / settings.humanPauseAfterLikes
+            : 0;
+        const avgBatchTime = settings.autoLikeBatchSize * (avgLikeDelay + avgAfterLikeDelay + avgPeekDelay + avgStoryDelay + avgPauseDelay) + settings.autoLikeScrollDelay + 700;
         if (avgBatchTime <= 0 || avgBatchClicks <= 0) {
             return { perHour: 0, perDay: 0 };
         }
