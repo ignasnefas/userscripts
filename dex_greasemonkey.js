@@ -187,6 +187,36 @@
         }
     }
 
+    function openLauncherWithUrls(urls) {
+        const html = `<!doctype html><html><head><meta charset="utf-8"><title>Opening Dexscreener tabs</title></head><body style="font-family:system-ui,sans-serif;background:#111;color:#eee;padding:1rem;"><h1 style="font-size:1.1rem;">Opening Dexscreener tabs</h1><p>Click the button below to open ${urls.length} Dexscreener tabs.</p><button id="openAll" style="padding:10px 16px;border:none;border-radius:10px;background:#26a69a;color:#111;font-size:14px;cursor:pointer;">Open all tabs</button><div id="links" style="margin-top:1rem;"></div><script>
+            const urls = ${JSON.stringify(urls)};
+            const button = document.getElementById('openAll');
+            const links = document.getElementById('links');
+            button.addEventListener('click', () => {
+                button.disabled = true;
+                urls.forEach(url => {
+                    const result = window.open(url, '_blank');
+                    const row = document.createElement('div');
+                    row.style.margin = '0.4rem 0';
+                    row.innerHTML = '<a href="' + url + '" target="_blank" rel="noopener noreferrer" style="color:#6cf;">' + url + '</a>' + (result ? ' <span style="color:#8f8;">opened</span>' : ' <span style="color:#f88;">blocked</span>');
+                    links.appendChild(row);
+                });
+            });
+        <\/script></body></html>`;
+        const blob = new Blob([html], { type: 'text/html' });
+        const blobUrl = URL.createObjectURL(blob);
+        window.open(blobUrl, '_blank');
+    }
+
+    function openAllDexscreenerTabs() {
+        const urls = Array.from(new Set(Array.from(document.querySelectorAll('a[href*="/solana/"]')).map(a => a.href)));
+        if (urls.length === 0) {
+            showToast('No Solana pair links found');
+            return;
+        }
+        openLauncherWithUrls(urls);
+    }
+
     function showResultOverlay(pairs, mode = 'tokens') {
         const result = buildResult(pairs, mode);
         const existing = document.getElementById('dex-pair-clipboard-overlay');
@@ -307,14 +337,18 @@
         const tokensButton = document.createElement('button');
         tokensButton.type = 'button';
         tokensButton.textContent = 'Copy all token CAs';
-        [contractsButton, tokensButton].forEach(btn => {
+        const openAllButton = document.createElement('button');
+        openAllButton.type = 'button';
+        openAllButton.textContent = 'Open all Dexscreener tabs';
+        [contractsButton, tokensButton, openAllButton].forEach(btn => {
             btn.style.cssText = 'padding:8px 10px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:13px;cursor:pointer;';
             btn.addEventListener('mouseenter', () => btn.style.background = '#2ac6b3');
             btn.addEventListener('mouseleave', () => btn.style.background = '#26a69a');
         });
         contractsButton.addEventListener('click', () => copyPairs('contracts'));
         tokensButton.addEventListener('click', () => copyPairs('tokens'));
-        container.append(title, contractsButton, tokensButton);
+        openAllButton.addEventListener('click', () => openAllDexscreenerTabs());
+        container.append(title, contractsButton, tokensButton, openAllButton);
         document.body.appendChild(container);
     }
 
