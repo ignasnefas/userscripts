@@ -59,7 +59,8 @@
     }
 
     function getPairIdFromHref(href) {
-        const match = href.match(/\/solana\/([A-Za-z0-9]{32,44})$/);
+        if (!href) return null;
+        const match = href.match(/\/solana\/([A-Za-z0-9]{32,44})(?:\/|[?#].*)?$/);
         return match ? match[1] : null;
     }
 
@@ -70,10 +71,186 @@
 
     const mcapMonitors = new Map();
     const monitorStorageKey = 'dex-enhance-mcap-monitors';
+    const monitorSettingsKey = 'dex-enhance-mcap-settings';
+    const monitorPresetsKey = 'dex-enhance-mcap-presets';
     let monitorSortBy = 'percent';
     let monitorSortDescending = true;
     let mcapMonitorPollHandle = null;
+    let monitorPollIndex = 0;
+    const monitorPollBatchSize = 3;
     let autoMonitorNewPairs = false;
+    let actionButtonVisibility = {
+        ca: true,
+        gmgn: true,
+        xca: true,
+        xticker: true,
+        bubble: true,
+        pumpfun: true,
+        solscan: true,
+        dextools: true,
+        telegram: true,
+        monitor: true
+    };
+    let monitorPresets = {};
+    let monitorSettings = {
+        panelLeft: null,
+        panelTop: null,
+        panelCollapsed: false,
+        sortBy: 'percent',
+        sortDescending: true,
+        autoMonitorNewPairs: false,
+        actionButtonVisibility: { ...actionButtonVisibility },
+        restoreMonitorsOnLoad: true
+    };
+
+    function loadMonitorPresets() {
+        try {
+            const raw = localStorage.getItem(monitorPresetsKey);
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === 'object' ? parsed : {};
+        } catch (e) {
+            console.warn('Failed to load monitor presets', e);
+            return {};
+        }
+    }
+
+    function saveMonitorPresets() {
+        try {
+            localStorage.setItem(monitorPresetsKey, JSON.stringify(monitorPresets));
+        } catch (e) {
+            console.warn('Failed to save monitor presets', e);
+        }
+    }
+
+    function applyMonitorPreset(name) {
+        const preset = monitorPresets[name];
+        if (!preset || !Array.isArray(preset) || preset.length === 0) {
+            showToast('Preset is empty or missing');
+            return;
+        }
+        const existing = new Set(mcapMonitors.keys());
+        const anchors = Array.from(document.querySelectorAll('a.ds-dex-table-row[href*="/solana/"]'));
+        preset.forEach(pairId => {
+            if (existing.has(pairId)) return;
+            const anchor = anchors.find(a => getPairIdFromHref(a.href) === pairId);
+            if (!anchor) return;
+            const button = insertCopyButton(anchor);
+            if (button) startMcapMonitor(pairId, anchor, button, true);
+        });
+        showToast('Loaded monitor preset "' + name + '"');
+    }
+
+    function saveCurrentMonitorPreset(name) {
+        if (!name) return;
+        monitorPresets[name] = Array.from(mcapMonitors.keys());
+        saveMonitorPresets();
+        showToast('Saved preset "' + name + '"');
+    }
+
+    function deleteMonitorPreset(name) {
+        if (!name || !monitorPresets[name]) return;
+        delete monitorPresets[name];
+        saveMonitorPresets();
+        showToast('Deleted preset "' + name + '"');
+    }
+
+    function showMonitorAlertSound() {
+        try {
+            const context = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+            oscillator.type = 'sine';
+            oscillator.frequency.value = 760;
+            gain.gain.value = 0.12;
+            oscillator.connect(gain);
+            gain.connect(context.destination);
+            oscillator.start();
+            setTimeout(() => {
+                oscillator.stop();
+                context.close();
+            }, 150);
+        } catch (e) {
+            console.warn('Alert sound failed', e);
+        }
+    }
+
+    function triggerMonitorAlert(item, message) {
+        showToast(message, 3600);
+        showMonitorAlertSound();
+        if (window.Notification && Notification.permission === 'granted') {
+            new Notification('Dex Enhance alert', { body: message });
+        } else if (window.Notification && Notification.permission !== 'denied') {
+            Notification.requestPermission().then(permission => {
+                if (permission === 'granted') {
+                    new Notification('Dex Enhance alert', { body: message });
+                }
+            });
+        }
+    }
+
+    function renderSparkline(values) {
+        if (!Array.isArray(values) || values.length === 0) return '';
+        const bars = '▁▂▃▄▅▆▇█';
+        const slice = values.slice(-8);
+        const min = Math.min(...slice);
+        const max = Math.max(...slice);
+        const range = max - min || 1;
+        return slice.map(v => bars[Math.floor(((v - min) / range) * (bars.length - 1))]).join('');
+    }
+
+    function checkMonitorAlerts(item, newValue) {
+        if (!item.thresholds) return;
+        const percentThreshold = typeof item.thresholds.percentChange === 'number' ? item.thresholds.percentChange : null;
+        const mcapThreshold = typeof item.thresholds.mcapChange === 'number' ? item.thresholds.mcapChange : null;
+        const percentValue = getPercentChangeValue(item.startValue, newValue);
+        const mcapValue = newValue - item.startValue;
+        if (percentThreshold !== null) {
+            const triggered = Math.abs(percentValue) >= Math.abs(percentThreshold);
+            if (triggered && !item.alertedPercent) {
+                item.alertedPercent = true;
+                triggerMonitorAlert(item, item.label + ' moved ' + formatPercentChange(item.startValue, newValue) + ' (threshold ' + percentThreshold + '%)');
+            } else if (!triggered) {
+                item.alertedPercent = false;
+            }
+        }
+        if (mcapThreshold !== null) {
+            const triggered = Math.abs(mcapValue) >= Math.abs(mcapThreshold);
+            if (triggered && !item.alertedMcap) {
+                item.alertedMcap = true;
+                triggerMonitorAlert(item, item.label + ' market cap changed by ' + formatMcapDisplay(mcapValue) + ' (threshold ' + formatMcapDisplay(mcapThreshold) + ')');
+            } else if (!triggered) {
+                item.alertedMcap = false;
+            }
+        }
+    }
+
+    function configureMonitorThreshold(item) {
+        const existing = item.thresholds || {};
+        const percentInput = prompt('Percent change alert threshold (%)\nUse a positive number to alert on both directions, or a negative value for negative moves only.', existing.percentChange != null ? String(existing.percentChange) : '');
+        if (percentInput === null) return;
+        const percentValue = percentInput.trim() === '' ? null : Number(percentInput.trim());
+        if (percentInput.trim() !== '' && Number.isNaN(percentValue)) {
+            showToast('Invalid percent threshold');
+            return;
+        }
+        const mcapInput = prompt('Absolute market cap alert threshold ($)\nUse a positive number for any move above that amount, or leave blank to clear.', existing.mcapChange != null ? String(existing.mcapChange) : '');
+        if (mcapInput === null) return;
+        const mcapValue = mcapInput.trim() === '' ? null : Number(mcapInput.trim());
+        if (mcapInput.trim() !== '' && Number.isNaN(mcapValue)) {
+            showToast('Invalid market cap threshold');
+            return;
+        }
+        item.thresholds = { percentChange: percentValue, mcapChange: mcapValue };
+        item.alertedPercent = false;
+        item.alertedMcap = false;
+        const stored = loadStoredMonitors();
+        stored[item.pairId] = stored[item.pairId] || {};
+        stored[item.pairId].thresholds = item.thresholds;
+        saveStoredMonitors(stored);
+        showToast('Alert thresholds updated');
+        updateMonitorPanel();
+    }
 
     function loadStoredMonitors() {
         try {
@@ -104,12 +281,137 @@
         }
     }
 
-    function addMonitorToStorage(pairId, startValue, addedAt, addedMcap) {
+    function loadMonitorSettings() {
+        try {
+            const raw = localStorage.getItem(monitorSettingsKey);
+            if (!raw) return { ...monitorSettings };
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return { ...monitorSettings };
+            return {
+                panelLeft: typeof parsed.panelLeft === 'number' ? parsed.panelLeft : null,
+                panelTop: typeof parsed.panelTop === 'number' ? parsed.panelTop : null,
+                panelCollapsed: Boolean(parsed.panelCollapsed),
+                sortBy: parsed.sortBy === 'date' ? 'date' : 'percent',
+                sortDescending: Boolean(parsed.sortDescending),
+                autoMonitorNewPairs: Boolean(parsed.autoMonitorNewPairs),
+                actionButtonVisibility: parsed.actionButtonVisibility && typeof parsed.actionButtonVisibility === 'object'
+                    ? { ...actionButtonVisibility, ...parsed.actionButtonVisibility }
+                    : { ...actionButtonVisibility },
+                restoreMonitorsOnLoad: parsed.restoreMonitorsOnLoad !== false
+            };
+        } catch (e) {
+            console.warn('Failed to load monitor settings', e);
+            return { ...monitorSettings };
+        }
+    }
+
+    function saveMonitorSettings() {
+        try {
+            localStorage.setItem(monitorSettingsKey, JSON.stringify(monitorSettings));
+        } catch (e) {
+            console.warn('Failed to save monitor settings', e);
+        }
+    }
+
+    function applyActionButtonVisibility(button) {
+        if (!button) return;
+        const key = button.dataset.dexActionKey;
+        if (!key) return;
+        const visible = monitorSettings.actionButtonVisibility?.[key] !== false;
+        button.style.display = visible ? '' : 'none';
+    }
+
+    function updateAllActionButtonVisibility() {
+        document.querySelectorAll('button[data-dex-action-button="1"]').forEach(applyActionButtonVisibility);
+    }
+
+    function configureActionButtons() {
+        const existing = document.getElementById('dex-action-button-config');
+        if (existing) return;
+        const overlay = document.createElement('div');
+        overlay.id = 'dex-action-button-config';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483655;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;padding:1rem;';
+        const dialog = document.createElement('div');
+        dialog.style.cssText = 'width:360px;background:#111;border:1px solid #444;border-radius:12px;box-shadow:0 0 40px rgba(0,0,0,0.7);overflow:hidden;font-family:system-ui,sans-serif;color:#eee;';
+        dialog.innerHTML = '<div style="padding:14px 16px;border-bottom:1px solid #333;font-size:14px;font-weight:700;">Action buttons</div>' +
+            '<div id="dex-action-button-config-list" style="padding:12px 16px;display:grid;grid-template-columns:1fr 1fr;gap:10px;"></div>' +
+            '<div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid #333;">' +
+            '<button id="dex-action-button-config-save" style="padding:8px 12px;border:none;border-radius:8px;background:#26a69a;color:#111;cursor:pointer;">Save</button>' +
+            '<button id="dex-action-button-config-cancel" style="padding:8px 12px;border:none;border-radius:8px;background:#444;color:#fff;cursor:pointer;">Cancel</button>' +
+            '</div>';
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        const types = [
+            { key: 'ca', label: 'CA' },
+            { key: 'gmgn', label: 'GMGN' },
+            { key: 'xca', label: 'X CA' },
+            { key: 'xticker', label: 'X $' },
+            { key: 'bubble', label: 'Bubble' },
+            { key: 'pumpfun', label: 'PumpFun' },
+            { key: 'solscan', label: 'Solscan' },
+            { key: 'dextools', label: 'DexTools' },
+            { key: 'telegram', label: 'Telegram' },
+            { key: 'monitor', label: 'Monitor' }
+        ];
+
+        const list = document.getElementById('dex-action-button-config-list');
+        types.forEach(type => {
+            const item = document.createElement('label');
+            item.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = monitorSettings.actionButtonVisibility[type.key] !== false;
+            input.dataset.key = type.key;
+            input.style.cssText = 'transform:scale(1.1);';
+            const text = document.createElement('span');
+            text.textContent = type.label;
+            item.appendChild(input);
+            item.appendChild(text);
+            list.appendChild(item);
+        });
+
+        document.getElementById('dex-action-button-config-save').addEventListener('click', () => {
+            const checkboxes = overlay.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(input => {
+                monitorSettings.actionButtonVisibility[input.dataset.key] = input.checked;
+            });
+            saveMonitorSettings();
+            updateAllActionButtonVisibility();
+            overlay.remove();
+            showToast('Action button visibility saved');
+        });
+        document.getElementById('dex-action-button-config-cancel').addEventListener('click', () => overlay.remove());
+    }
+
+    function debounce(fn, delay = 200) {
+        let timeout = null;
+        return () => {
+            if (timeout) clearTimeout(timeout);
+            timeout = setTimeout(() => {
+                timeout = null;
+                fn();
+            }, delay);
+        };
+    }
+
+    function updateMonitorRowInfo(item) {
+        if (!item.button) return;
+        const wrapper = item.button.closest('span[data-dex-copy-wrapper="1"]');
+        if (!wrapper) return;
+        const info = wrapper.querySelector('.dex-mcap-monitor-row-info');
+        if (info) {
+            info.remove();
+        }
+    }
+
+    function addMonitorToStorage(pairId, startValue, addedAt, addedMcap, thresholds = null) {
         const stored = loadStoredMonitors();
         stored[pairId] = {
             startValue: typeof startValue === 'number' ? startValue : stored[pairId]?.startValue || null,
             addedAt: addedAt ? addedAt.toISOString() : stored[pairId]?.addedAt || new Date().toISOString(),
-            addedMcap: typeof addedMcap === 'number' ? addedMcap : stored[pairId]?.addedMcap || null
+            addedMcap: typeof addedMcap === 'number' ? addedMcap : stored[pairId]?.addedMcap || null,
+            thresholds: thresholds || stored[pairId]?.thresholds || null
         };
         saveStoredMonitors(stored);
     }
@@ -135,7 +437,8 @@
             const startValue = typeof storedData.startValue === 'number' ? storedData.startValue : null;
             const addedAt = storedData.addedAt ? new Date(storedData.addedAt) : null;
             const addedMcap = typeof storedData.addedMcap === 'number' ? storedData.addedMcap : null;
-            startMcapMonitor(pairId, anchor, button, true, startValue, addedAt, addedMcap);
+            const thresholds = storedData.thresholds && typeof storedData.thresholds === 'object' ? storedData.thresholds : null;
+            startMcapMonitor(pairId, anchor, button, true, startValue, addedAt, addedMcap, thresholds);
         });
     }
 
@@ -196,6 +499,35 @@
         const match = text.match(/^(.*?)\s*\/\s*SOL/i);
         if (match && match[1]) text = match[1].trim();
         return text.slice(0, 28);
+    }
+
+    function getTokenImageUrl(row) {
+        const tokenCell = row.querySelector('.ds-dex-table-row-col-token');
+        if (!tokenCell) return null;
+        const directImg = tokenCell.querySelector('img.ds-dex-table-row-token-icon-img');
+        if (directImg) {
+            return directImg.src || directImg.dataset?.src || directImg.currentSrc || null;
+        }
+        const stackImg = tokenCell.querySelector('.ds-dex-table-row-token-icon-stack img');
+        if (stackImg) {
+            return stackImg.src || stackImg.dataset?.src || stackImg.currentSrc || null;
+        }
+        const imgs = Array.from(tokenCell.querySelectorAll('img'));
+        if (imgs.length === 0) return null;
+        const cmsImg = imgs.find(img => {
+            const src = (img.src || img.dataset?.src || img.currentSrc || '').toLowerCase();
+            return src.includes('/cms/images/');
+        });
+        if (cmsImg) {
+            return cmsImg.src || cmsImg.dataset?.src || cmsImg.currentSrc || null;
+        }
+        const isChainIcon = img => {
+            const alt = (img.alt || '').toLowerCase();
+            const src = (img.src || img.dataset?.src || img.currentSrc || '').toLowerCase();
+            return /solana|chain|network|platform|logo|dexes\/pumpswap|dexes\/pumpfun|pump\.fun|pumpfun|pumpswap|dex|solana\.png|sol\.png/.test(alt + ' ' + src);
+        };
+        const tokenImg = imgs.find(img => !isChainIcon(img)) || imgs[0];
+        return tokenImg.src || tokenImg.dataset?.src || tokenImg.currentSrc || null;
     }
 
     function formatMcapDisplay(value) {
@@ -286,6 +618,15 @@
             row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);font-size:12px;color:#ddd;';
             const labelContainer = document.createElement('div');
             labelContainer.style.cssText = 'display:flex;flex-direction:column;gap:2px;max-width:130px;';
+            const labelRow = document.createElement('div');
+            labelRow.style.cssText = 'display:flex;align-items:center;gap:6px;';
+            if (item.imageUrl) {
+                const avatar = document.createElement('img');
+                avatar.src = item.imageUrl;
+                avatar.alt = item.label;
+                avatar.style.cssText = 'width:18px;height:18px;border-radius:50%;object-fit:cover;';
+                labelRow.appendChild(avatar);
+            }
             const label = document.createElement('span');
             label.textContent = item.label;
             label.style.cssText = 'cursor:pointer;text-decoration:underline;color:#9af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
@@ -293,13 +634,24 @@
             label.addEventListener('click', () => {
                 window.open('https://dexscreener.com/solana/' + encodeURIComponent(item.pairId), '_blank');
             });
+            labelRow.appendChild(label);
+            labelContainer.appendChild(labelRow);
             const added = document.createElement('span');
             added.textContent = 'added ' + formatMonitorDate(item.addedAt) + ' (' + formatMonitorAge(item.addedAt) + ') @ ' + formatMcapDisplay(item.addedMcap);
             added.style.cssText = 'font-size:10px;color:#999;line-height:1.2;';
-            labelContainer.append(label, added);
+            const sparkline = document.createElement('span');
+            sparkline.textContent = renderSparkline(item.history);
+            sparkline.style.cssText = 'font-size:10px;color:#9af;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;';
+            labelContainer.append(label, sparkline, added);
             const status = document.createElement('span');
             const percentText = formatPercentChange(item.startValue, item.lastValue);
             status.innerHTML = formatMcapDisplay(item.lastValue) + ' (<span style="color:' + (percentText.startsWith('-') ? '#f56' : '#7cfa8e') + ';">' + percentText + '</span>)';
+            const alertButton = document.createElement('button');
+            alertButton.type = 'button';
+            alertButton.textContent = '⚠';
+            alertButton.title = 'Configure alert thresholds';
+            alertButton.style.cssText = 'padding:2px 8px;border:none;border-radius:6px;background:rgba(249,202,35,0.95);color:#111;font-size:12px;cursor:pointer;';
+            alertButton.addEventListener('click', () => configureMonitorThreshold(item));
             const stop = document.createElement('button');
             stop.type = 'button';
             stop.textContent = '✕';
@@ -315,7 +667,7 @@
                 updateMonitorPanel();
                 showToast('Removed monitor for ' + item.pairId);
             });
-            row.append(labelContainer, status, stop);
+            row.append(labelContainer, status, alertButton, stop);
             list.appendChild(row);
         });
     }
@@ -330,7 +682,14 @@
     function startMcapPolling() {
         if (mcapMonitorPollHandle !== null) return;
         mcapMonitorPollHandle = setInterval(() => {
-            mcapMonitors.forEach(item => {
+            const monitors = Array.from(mcapMonitors.values());
+            if (monitors.length === 0) return;
+            const batchSize = monitors.length <= monitorPollBatchSize ? monitors.length : monitorPollBatchSize;
+            const startIndex = monitorPollIndex % monitors.length;
+            let processed = 0;
+            for (let i = 0; i < monitors.length && processed < batchSize; i += 1) {
+                const idx = (startIndex + i) % monitors.length;
+                const item = monitors[idx];
                 if (!document.body.contains(item.row)) {
                     const fallback = findMcapRowForPair(item.pairId);
                     if (fallback) {
@@ -342,18 +701,29 @@
                 if (currentCell) {
                     const newValue = parseMcapValue(currentCell.textContent);
                     if (newValue !== null && newValue !== item.lastValue) {
+                        item.history.push(newValue);
+                        if (item.history.length > 8) item.history.shift();
                         item.lastValue = newValue;
+                        checkMonitorAlerts(item, newValue);
+                        updateMonitorRowInfo(item);
                         updateMonitorPanel();
                     }
-                    return;
+                    processed += 1;
+                    continue;
                 }
                 void (async () => {
                     const apiValue = await fetchPairMcap(item.pairId);
                     if (apiValue === null || apiValue === item.lastValue) return;
+                    item.history.push(apiValue);
+                    if (item.history.length > 8) item.history.shift();
                     item.lastValue = apiValue;
+                    checkMonitorAlerts(item, apiValue);
+                    updateMonitorRowInfo(item);
                     updateMonitorPanel();
                 })();
-            });
+                processed += 1;
+            }
+            monitorPollIndex = (monitorPollIndex + processed) % monitors.length;
         }, 2000);
     }
 
@@ -391,7 +761,7 @@
         showToast(count > 0 ? 'Started ' + count + ' MCap monitors' : 'No new MCap monitors found');
     }
 
-    function startMcapMonitor(pairId, anchor, button, silent = false, persistedStartValue = null, persistedAddedAt = null, persistedAddedMcap = null) {
+    function startMcapMonitor(pairId, anchor, button, silent = false, persistedStartValue = null, persistedAddedAt = null, persistedAddedMcap = null, persistedThresholds = null) {
         const existing = mcapMonitors.get(pairId);
         if (existing) {
             existing.observer.disconnect();
@@ -422,12 +792,17 @@
         const startValue = typeof persistedStartValue === 'number' && persistedStartValue > 0 ? persistedStartValue : currentValue;
         const addedAt = persistedAddedAt instanceof Date && !Number.isNaN(persistedAddedAt.getTime()) ? persistedAddedAt : new Date();
         const addedMcap = typeof persistedAddedMcap === 'number' && persistedAddedMcap > 0 ? persistedAddedMcap : currentValue;
+        const thresholds = persistedThresholds && typeof persistedThresholds === 'object' ? {
+            percentChange: typeof persistedThresholds.percentChange === 'number' ? persistedThresholds.percentChange : null,
+            mcapChange: typeof persistedThresholds.mcapChange === 'number' ? persistedThresholds.mcapChange : null
+        } : { percentChange: null, mcapChange: null };
         const label = getTokenLabel(row);
+        const imageUrl = getTokenImageUrl(row);
 
         let lastValue = currentValue;
         let currentRow = row;
         let currentCell = cell;
-        const item = { observer: null, button, pairId, row: currentRow, cell: currentCell, lastValue, startValue, label, addedAt, addedMcap };
+        const item = { observer: null, button, pairId, row: currentRow, cell: currentCell, lastValue, startValue, label, addedAt, addedMcap, imageUrl, thresholds, history: [currentValue], alertedPercent: false, alertedMcap: false };
         const ensureRowAndCell = () => {
             if (currentCell && currentRow && document.body.contains(currentRow)) {
                 return true;
@@ -444,7 +819,11 @@
             if (!ensureRowAndCell()) return;
             const newValue = parseMcapValue(currentCell.textContent);
             if (newValue === null || newValue === lastValue) return;
+            item.history.push(newValue);
+            if (item.history.length > 8) item.history.shift();
             item.lastValue = newValue;
+            checkMonitorAlerts(item, newValue);
+            updateMonitorRowInfo(item);
             updateMonitorPanel();
             lastValue = newValue;
         };
@@ -452,8 +831,9 @@
         observer.observe(currentRow, { childList: true, characterData: true, subtree: true, attributes: true });
         item.observer = observer;
         mcapMonitors.set(pairId, item);
-        addMonitorToStorage(pairId, startValue, addedAt, addedMcap);
+        addMonitorToStorage(pairId, startValue, addedAt, addedMcap, item.thresholds);
         startMcapPolling();
+        updateMonitorRowInfo(item);
         button.dataset.dexMcapButton = '1';
         button.textContent = 'Monitoring';
         button.style.opacity = '0.9';
@@ -485,7 +865,6 @@
                 pair.baseToken?.marketcapUsd,
                 pair.marketCap,
                 pair.marketcap,
-                pair.priceUsd,
                 pair.baseToken?.liquidity?.usd,
                 pair.pair?.liquidity?.usd,
                 pair.liquidity?.usd
@@ -646,6 +1025,40 @@
         }
     }
 
+    async function openSolscan(pairId) {
+        try {
+            const pair = await fetchPairInfo(pairId);
+            const address = pair.baseToken?.address || pair.pairAddress;
+            window.open('https://solscan.io/token/' + encodeURIComponent(address), '_blank');
+        } catch (e) {
+            console.warn('openSolscan failed', e);
+            alert('Unable to open Solscan for this contract.');
+        }
+    }
+
+    async function openDexTools(pairId) {
+        try {
+            const pair = await fetchPairInfo(pairId);
+            const address = pair.pairAddress || pair.baseToken?.address;
+            window.open('https://www.dextools.io/app/solana/pair-explorer/' + encodeURIComponent(address), '_blank');
+        } catch (e) {
+            console.warn('openDexTools failed', e);
+            alert('Unable to open DexTools for this contract.');
+        }
+    }
+
+    async function openTelegram(pairId) {
+        try {
+            const pair = await fetchPairInfo(pairId);
+            const symbol = pair.baseToken?.symbol || pair.pairAddress || pair.pairAddress;
+            const query = symbol ? '$' + symbol.replace(/^[^A-Za-z0-9]+/, '') : pair.pairAddress;
+            window.open('https://t.me/search?q=' + encodeURIComponent(query), '_blank');
+        } catch (e) {
+            console.warn('openTelegram failed', e);
+            alert('Unable to open Telegram search for this contract.');
+        }
+    }
+
     function openLauncherWithUrls(urls) {
         const html = `<!doctype html><html><head><meta charset="utf-8"><title>Opening Dexscreener tabs</title></head><body style="font-family:system-ui,sans-serif;background:#111;color:#eee;padding:1rem;"><h1 style="font-size:1.1rem;">Opening Dexscreener tabs</h1><p>Click the button below to open ${urls.length} Dexscreener tabs.</p><button id="openAll" style="padding:10px 16px;border:none;border-radius:10px;background:#26a69a;color:#111;font-size:14px;cursor:pointer;">Open all tabs</button><div id="links" style="margin-top:1rem;"></div><script>
             const urls = ${JSON.stringify(urls)};
@@ -797,6 +1210,36 @@
             openPumpFun(pairId);
         });
 
+        const solscanButton = document.createElement('button');
+        solscanButton.type = 'button';
+        solscanButton.textContent = 'SC';
+        solscanButton.style.cssText = 'padding:2px 8px;border:none;border-radius:6px;background:rgba(0,122,255,0.95);color:#fff;font-size:11px;cursor:pointer;line-height:1;white-space:nowrap;';
+        solscanButton.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            openSolscan(pairId);
+        });
+
+        const dexToolsButton = document.createElement('button');
+        dexToolsButton.type = 'button';
+        dexToolsButton.textContent = 'DT';
+        dexToolsButton.style.cssText = 'padding:2px 8px;border:none;border-radius:6px;background:rgba(123,0,255,0.95);color:#fff;font-size:11px;cursor:pointer;line-height:1;white-space:nowrap;';
+        dexToolsButton.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            openDexTools(pairId);
+        });
+
+        const telegramButton = document.createElement('button');
+        telegramButton.type = 'button';
+        telegramButton.textContent = 'TG';
+        telegramButton.style.cssText = 'padding:2px 8px;border:none;border-radius:6px;background:rgba(0,136,204,0.95);color:#fff;font-size:11px;cursor:pointer;line-height:1;white-space:nowrap;';
+        telegramButton.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            openTelegram(pairId);
+        });
+
         const mcapButton = document.createElement('button');
         mcapButton.type = 'button';
         mcapButton.dataset.dexMcapButton = '1';
@@ -808,8 +1251,22 @@
             startMcapMonitor(pairId, anchor, mcapButton);
         });
 
-        wrapper.append(copyButton, gmgnButton, xcaButton, xtickerButton, bubbleButton, pumpFunButton, mcapButton);
+        copyButton.dataset.dexActionKey = 'ca';
+        gmgnButton.dataset.dexActionKey = 'gmgn';
+        xcaButton.dataset.dexActionKey = 'xca';
+        xtickerButton.dataset.dexActionKey = 'xticker';
+        bubbleButton.dataset.dexActionKey = 'bubble';
+        pumpFunButton.dataset.dexActionKey = 'pumpfun';
+        solscanButton.dataset.dexActionKey = 'solscan';
+        dexToolsButton.dataset.dexActionKey = 'dextools';
+        telegramButton.dataset.dexActionKey = 'telegram';
+        mcapButton.dataset.dexActionKey = 'monitor';
+        [copyButton, gmgnButton, xcaButton, xtickerButton, bubbleButton, pumpFunButton, solscanButton, dexToolsButton, telegramButton, mcapButton].forEach(btn => {
+            btn.dataset.dexActionButton = '1';
+        });
+        wrapper.append(copyButton, gmgnButton, xcaButton, xtickerButton, bubbleButton, pumpFunButton, solscanButton, dexToolsButton, telegramButton, mcapButton);
         anchor.insertAdjacentElement('afterend', wrapper);
+        updateAllActionButtonVisibility();
         return mcapButton;
     }
 
@@ -842,7 +1299,7 @@
         toggleButton.textContent = 'Collapse';
         toggleButton.style.cssText = 'padding:4px 8px;border:none;border-radius:8px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;';
         const buttonGroup = document.createElement('div');
-        buttonGroup.style.cssText = 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;';
+        buttonGroup.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;';
         const dipButton = document.createElement('button');
         dipButton.type = 'button';
         dipButton.textContent = 'Dip Only';
@@ -851,12 +1308,15 @@
         rangeButton.textContent = '20-100K';
         const autoMonitorButton = document.createElement('button');
         autoMonitorButton.type = 'button';
-        autoMonitorButton.textContent = 'Auto monitor OFF';
+        autoMonitorButton.textContent = autoMonitorNewPairs ? 'Auto monitor ON' : 'Auto monitor OFF';
         const monitorAllButton = document.createElement('button');
         monitorAllButton.type = 'button';
         monitorAllButton.textContent = 'Monitor all';
-        [dipButton, rangeButton, autoMonitorButton, monitorAllButton].forEach(btn => {
-            btn.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        const actionConfigButton = document.createElement('button');
+        actionConfigButton.type = 'button';
+        actionConfigButton.textContent = 'Button config';
+        [dipButton, rangeButton, autoMonitorButton, monitorAllButton, actionConfigButton].forEach(btn => {
+            btn.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:12px;line-height:1.2;cursor:pointer;white-space:normal;word-break:break-word;overflow:hidden;text-overflow:ellipsis;min-height:40px;';
             btn.addEventListener('mouseenter', () => btn.style.background = '#2ac6b3');
             btn.addEventListener('mouseleave', () => btn.style.background = '#26a69a');
         });
@@ -870,16 +1330,36 @@
         autoMonitorButton.id = 'dex-auto-monitor-toggle';
         autoMonitorButton.addEventListener('click', () => {
             autoMonitorNewPairs = !autoMonitorNewPairs;
+            monitorSettings.autoMonitorNewPairs = autoMonitorNewPairs;
+            saveMonitorSettings();
             autoMonitorButton.textContent = autoMonitorNewPairs ? 'Auto monitor ON' : 'Auto monitor OFF';
             if (autoMonitorNewPairs) addNewMcapMonitors();
             showToast(autoMonitorNewPairs ? 'Enabled auto-monitor for new pairs' : 'Disabled auto-monitor');
         });
+        actionConfigButton.addEventListener('click', () => {
+            configureActionButtons();
+        });
+        const restoreToggleButton = document.createElement('button');
+        restoreToggleButton.type = 'button';
+        restoreToggleButton.textContent = monitorSettings.restoreMonitorsOnLoad ? 'Restore ON' : 'Restore OFF';
+        restoreToggleButton.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        restoreToggleButton.addEventListener('mouseenter', () => restoreToggleButton.style.background = '#2ac6b3');
+        restoreToggleButton.addEventListener('mouseleave', () => restoreToggleButton.style.background = '#26a69a');
+        restoreToggleButton.addEventListener('click', () => {
+            monitorSettings.restoreMonitorsOnLoad = !monitorSettings.restoreMonitorsOnLoad;
+            saveMonitorSettings();
+            restoreToggleButton.textContent = monitorSettings.restoreMonitorsOnLoad ? 'Restore ON' : 'Restore OFF';
+            showToast(monitorSettings.restoreMonitorsOnLoad ? 'Monitor restore enabled' : 'Monitor restore disabled');
+        });
         toggleButton.addEventListener('click', () => {
             const collapsed = container.dataset.collapsed === '1';
-            container.dataset.collapsed = collapsed ? '0' : '1';
-            buttonGroup.style.display = collapsed ? 'flex' : 'none';
-            monitorPanel.style.display = collapsed ? 'block' : 'none';
-            toggleButton.textContent = collapsed ? 'Collapse' : 'Expand';
+            const nextCollapsed = !collapsed;
+            container.dataset.collapsed = nextCollapsed ? '1' : '0';
+            buttonGroup.style.display = nextCollapsed ? 'none' : 'grid';
+            monitorPanel.style.display = nextCollapsed ? 'none' : 'flex';
+            toggleButton.textContent = nextCollapsed ? 'Expand' : 'Collapse';
+            monitorSettings.panelCollapsed = nextCollapsed;
+            saveMonitorSettings();
         });
         const monitorPanel = document.createElement('div');
         monitorPanel.id = 'dex-mcap-monitor-panel';
@@ -894,8 +1374,61 @@
             '</div>' +
             '<div class="dex-mcap-monitor-list" style="overflow:auto;color:#ddd;font-size:12px;min-height:40px;"></div>';
         header.append(title, toggleButton);
-        buttonGroup.append(dipButton, rangeButton, autoMonitorButton, monitorAllButton);
-        container.append(header, buttonGroup, monitorPanel);
+        buttonGroup.append(dipButton, rangeButton, autoMonitorButton, monitorAllButton, actionConfigButton, restoreToggleButton);
+        const presetRow = document.createElement('div');
+        presetRow.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;';
+        const presetSelect = document.createElement('select');
+        presetSelect.style.cssText = 'flex:1;min-width:120px;padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#111;color:#fff;font-size:12px;';
+        const presetLoadButton = document.createElement('button');
+        presetLoadButton.type = 'button';
+        presetLoadButton.textContent = 'Load';
+        const presetSaveButton = document.createElement('button');
+        presetSaveButton.type = 'button';
+        presetSaveButton.textContent = 'Save';
+        const presetDeleteButton = document.createElement('button');
+        presetDeleteButton.type = 'button';
+        presetDeleteButton.textContent = 'Del';
+        [presetLoadButton, presetSaveButton, presetDeleteButton].forEach(btn => {
+            btn.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#444;color:#fff;font-size:12px;cursor:pointer;';
+            btn.addEventListener('mouseenter', () => btn.style.background = '#555');
+            btn.addEventListener('mouseleave', () => btn.style.background = '#444');
+        });
+        presetLoadButton.addEventListener('click', () => {
+            if (!presetSelect.value) return;
+            applyMonitorPreset(presetSelect.value);
+        });
+        presetSaveButton.addEventListener('click', () => {
+            const name = prompt('Preset name:', 'My preset');
+            if (!name) return;
+            saveCurrentMonitorPreset(name.trim());
+            refreshPresetOptions();
+        });
+        presetDeleteButton.addEventListener('click', () => {
+            if (!presetSelect.value) return;
+            deleteMonitorPreset(presetSelect.value);
+            refreshPresetOptions();
+        });
+        presetRow.append(presetSelect, presetLoadButton, presetSaveButton, presetDeleteButton);
+        const refreshPresetOptions = () => {
+            presetSelect.innerHTML = '<option value="">Preset</option>';
+            Object.keys(monitorPresets).forEach(name => {
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = name;
+                presetSelect.appendChild(option);
+            });
+        };
+        refreshPresetOptions();
+        container.append(header, buttonGroup, presetRow, monitorPanel);
+        if (monitorSettings.panelLeft !== null && monitorSettings.panelTop !== null) {
+            container.style.left = monitorSettings.panelLeft + 'px';
+            container.style.top = monitorSettings.panelTop + 'px';
+            container.style.right = 'auto';
+        }
+        container.dataset.collapsed = monitorSettings.panelCollapsed ? '1' : '0';
+        buttonGroup.style.display = monitorSettings.panelCollapsed ? 'none' : 'grid';
+        monitorPanel.style.display = monitorSettings.panelCollapsed ? 'none' : 'flex';
+        toggleButton.textContent = monitorSettings.panelCollapsed ? 'Expand' : 'Collapse';
         document.body.appendChild(container);
 
         let dragState = null;
@@ -939,6 +1472,12 @@
             document.addEventListener('pointercancel', onPointerUp);
             event.preventDefault();
         });
+        header.addEventListener('pointerup', event => {
+            if (!dragState) return;
+            monitorSettings.panelLeft = parseInt(container.style.left, 10) || 0;
+            monitorSettings.panelTop = parseInt(container.style.top, 10) || 0;
+            saveMonitorSettings();
+        });
         header.addEventListener('pointermove', onPointerMove);
         header.addEventListener('pointerup', onPointerUp);
         header.addEventListener('pointercancel', onPointerUp);
@@ -954,6 +1493,9 @@
                     monitorSortBy = 'percent';
                     monitorSortDescending = true;
                 }
+                monitorSettings.sortBy = monitorSortBy;
+                monitorSettings.sortDescending = monitorSortDescending;
+                saveMonitorSettings();
                 updateMonitorSortButton();
                 updateMonitorPanel();
             });
@@ -966,6 +1508,9 @@
                     monitorSortBy = 'date';
                     monitorSortDescending = true;
                 }
+                monitorSettings.sortBy = monitorSortBy;
+                monitorSettings.sortDescending = monitorSortDescending;
+                saveMonitorSettings();
                 updateMonitorSortButton();
                 updateMonitorPanel();
             });
@@ -973,6 +1518,8 @@
         updateMonitorSortButton();
         updateMonitorPanel();
     }
+
+    const debouncedScanDexscreenerLinks = debounce(scanDexscreenerLinks, 200);
 
     function scanDexscreenerLinks() {
         cleanupCopyWrappers();
@@ -988,10 +1535,18 @@
     }
 
     function observeDexscreener() {
+        monitorSettings = loadMonitorSettings();
+        monitorPresets = loadMonitorPresets();
+        monitorSortBy = monitorSettings.sortBy;
+        monitorSortDescending = monitorSettings.sortDescending;
+        autoMonitorNewPairs = monitorSettings.autoMonitorNewPairs;
         scanDexscreenerLinks();
         createFloatingControls();
-        restoreMonitors();
-        const observer = new MutationObserver(() => scanDexscreenerLinks());
+        if (monitorSettings.restoreMonitorsOnLoad) {
+            restoreMonitors();
+        }
+        if (autoMonitorNewPairs) addNewMcapMonitors();
+        const observer = new MutationObserver(debouncedScanDexscreenerLinks);
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
