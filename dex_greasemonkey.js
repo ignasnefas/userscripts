@@ -333,16 +333,26 @@
             mcapMonitors.forEach(item => {
                 if (!document.body.contains(item.row)) {
                     const fallback = findMcapRowForPair(item.pairId);
-                    if (!fallback) return;
-                    item.row = fallback.row;
-                    item.cell = fallback.cell;
+                    if (fallback) {
+                        item.row = fallback.row;
+                        item.cell = fallback.cell;
+                    }
                 }
                 const currentCell = item.cell || getMcapCell(item.row);
-                if (!currentCell) return;
-                const newValue = parseMcapValue(currentCell.textContent);
-                if (newValue === null || newValue === item.lastValue) return;
-                item.lastValue = newValue;
-                updateMonitorPanel();
+                if (currentCell) {
+                    const newValue = parseMcapValue(currentCell.textContent);
+                    if (newValue !== null && newValue !== item.lastValue) {
+                        item.lastValue = newValue;
+                        updateMonitorPanel();
+                    }
+                    return;
+                }
+                void (async () => {
+                    const apiValue = await fetchPairMcap(item.pairId);
+                    if (apiValue === null || apiValue === item.lastValue) return;
+                    item.lastValue = apiValue;
+                    updateMonitorPanel();
+                })();
             });
         }, 2000);
     }
@@ -463,6 +473,37 @@
             throw new Error('Pair data missing for ' + pairId);
         }
         return pair;
+    }
+
+    async function fetchPairMcap(pairId) {
+        try {
+            const pair = await fetchPairInfo(pairId);
+            const candidates = [
+                pair.baseToken?.marketCap,
+                pair.baseToken?.marketcap,
+                pair.baseToken?.marketCapUsd,
+                pair.baseToken?.marketcapUsd,
+                pair.marketCap,
+                pair.marketcap,
+                pair.priceUsd,
+                pair.baseToken?.liquidity?.usd,
+                pair.pair?.liquidity?.usd,
+                pair.liquidity?.usd
+            ];
+            for (const value of candidates) {
+                if (value == null) continue;
+                if (typeof value === 'number') return value;
+                if (typeof value === 'string') {
+                    const parsed = parseMcapValue(value);
+                    if (parsed !== null) return parsed;
+                    const plain = Number(value.replace(/[^0-9\.]/g, ''));
+                    if (!Number.isNaN(plain)) return plain;
+                }
+            }
+        } catch (e) {
+            console.warn('fetchPairMcap failed', pairId, e);
+        }
+        return null;
     }
 
     async function copyPairs(mode = 'tokens') {
