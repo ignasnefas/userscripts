@@ -244,23 +244,40 @@
     // ----------------------------
     // AUTO LIKER
     // ----------------------------
+    function isSinglePostView() {
+        const path = window.location.pathname.toLowerCase();
+        return /^\/(p|reel|tv)\/[\w-]+/.test(path);
+    }
+
+    function isNavigationalPostLink(element) {
+        if (!element || element.nodeType !== 1) return false;
+        const href = (element.getAttribute('href') || '').toLowerCase();
+        return /(^\/(p|reel|tv)\/)|\/(p|reel|tv)\//.test(href);
+    }
+
+    function normalizeLikeTarget(element) {
+        if (!element) return null;
+        const target = element.closest('button, [role="button"]') || element;
+        return isNavigationalPostLink(target) ? null : target;
+    }
+
     function findLikeControl(post) {
         if (isHiddenPost(post)) return null;
 
         const button = post.querySelector('button[aria-label*="like"], button[aria-label*="Unlike"], [role="button"][aria-label*="like"], [role="button"][aria-label*="Unlike"]');
-        if (button) return button;
+        if (button && !isNavigationalPostLink(button)) return button;
 
         const candidates = [...post.querySelectorAll('[aria-label]')]
             .map(el => ({
                 el,
                 label: (el.getAttribute('aria-label') || '').trim().toLowerCase()
             }))
-            .filter(item => item.label.includes('like'));
+            .filter(item => item.label.includes('like') && !isNavigationalPostLink(item.el));
 
         if (!candidates.length) return null;
 
         const unliked = candidates.find(item => !item.label.includes('unlike')) || candidates[0];
-        return unliked.el.closest('button, [role="button"]') || unliked.el;
+        return normalizeLikeTarget(unliked.el);
     }
 
     function isPostLiked(post) {
@@ -307,6 +324,12 @@
 
     function safeClick(target) {
         if (!target) return false;
+        const navTarget = target.closest('a') || target;
+        if (isNavigationalPostLink(navTarget)) {
+            if (settings.debugMode) console.warn('[AutoLiker] prevented navigation click on post link', navTarget);
+            return false;
+        }
+
         try {
             scrollIntoViewForInteraction(target);
             if (typeof target.click === 'function') {
@@ -523,6 +546,12 @@
     async function autoLikeStep() {
         logAutoLiker('autoLikeStep called', 'enabled=', settings.autoLikeEnabled);
         if (!settings.autoLikeEnabled) return;
+
+        if (isSinglePostView()) {
+            logAutoLiker('single-post/reel detail view detected, pausing actions until feed returns');
+            autoLikeTimer = window.setTimeout(autoLikeStep, settings.autoLikeScrollDelay);
+            return;
+        }
 
         if (await maybeTakeLongBreak()) {
             const afterBreakDelay = humanDelay(settings.autoLikeMinDelay, settings.autoLikeMaxDelay);
