@@ -39,6 +39,25 @@
         setTimeout(() => toast.remove(), duration);
     }
 
+    function showInfoPanel(message, type = 'info') {
+        const existing = document.getElementById('dex-pair-info-panel');
+        if (existing) existing.remove();
+        const panel = document.createElement('div');
+        panel.id = 'dex-pair-info-panel';
+        const color = type === 'error' ? '#e74c3c' : type === 'warn' ? '#f39c12' : '#1abc9c';
+        panel.style.cssText = 'position:fixed;top:88px;right:16px;z-index:2147483650;max-width:320px;background:rgba(17,22,28,0.96);border-left:4px solid ' + color + ';padding:12px 14px;border-radius:10px;box-shadow:0 24px 60px rgba(0,0,0,.45);color:#fff;font-family:system-ui,sans-serif;font-size:13px;line-height:1.5;';
+        panel.innerHTML = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">' +
+            '<div style="flex:1;min-width:0;">' +
+            '<div style="font-weight:700;margin-bottom:6px;">' + (type === 'error' ? 'Error' : type === 'warn' ? 'Warning' : 'Info') + '</div>' +
+            '<div style="white-space:pre-wrap;word-break:break-word;">' + String(message).replace(/\n/g, '<br>') + '</div>' +
+            '</div>' +
+            '<button id="dex-pair-info-close" style="border:none;background:transparent;color:#fff;font-size:16px;cursor:pointer;line-height:1;">✕</button>' +
+            '</div>';
+        document.body.appendChild(panel);
+        document.getElementById('dex-pair-info-close').addEventListener('click', () => panel.remove());
+        setTimeout(() => panel.remove(), 12000);
+    }
+
     function getPairIdFromHref(href) {
         const match = href.match(/\/solana\/([A-Za-z0-9]{32,44})$/);
         return match ? match[1] : null;
@@ -48,6 +67,8 @@
         const next = anchor.nextElementSibling;
         return next && next.dataset?.dexCopyWrapper === '1' ? next : null;
     }
+
+    const mcapMonitors = new Map();
 
     function cleanupCopyWrappers() {
         document.querySelectorAll('span[data-dex-copy-wrapper="1"]').forEach(wrapper => {
@@ -61,6 +82,189 @@
                 wrapper.remove();
             }
         });
+    }
+
+    function parseMcapValue(text) {
+        if (!text) return null;
+        const cleaned = text.replace(/[^0-9\.KMGBkmgb]/g, '').trim();
+        if (!cleaned) return null;
+        const number = parseFloat(cleaned);
+        if (Number.isNaN(number)) return null;
+        if (/k$/i.test(cleaned)) return number * 1e3;
+        if (/m$/i.test(cleaned)) return number * 1e6;
+        if (/b$/i.test(cleaned)) return number * 1e9;
+        return number;
+    }
+
+    function getMcapCell(row) {
+        return row.querySelector('.ds-dex-table-row-col-market-cap');
+    }
+
+    function getRowFromAnchor(anchor) {
+        return anchor.closest('a.ds-dex-table-row');
+    }
+
+    function getTokenLabel(row) {
+        const tokenCell = row.querySelector('.ds-dex-table-row-col-token');
+        if (!tokenCell) return 'Unknown';
+        let text = tokenCell.textContent.replace(/\n/g, ' ').trim();
+        text = text.replace(/^#\d+\s*/, '');
+        const match = text.match(/^(.*?)\s*\/\s*SOL/i);
+        if (match && match[1]) text = match[1].trim();
+        return text.slice(0, 28);
+    }
+
+    function formatMcapDisplay(value) {
+        if (value === null || value === undefined) return 'n/a';
+        const formatSuffix = (num, suffix) => {
+            const scaled = num;
+            const rounded = Math.round(scaled);
+            if (rounded === scaled) return '$' + rounded + suffix;
+            return '$' + scaled.toFixed(1).replace(/\.0$/, '') + suffix;
+        };
+        if (value >= 1e9) return formatSuffix(value / 1e9, 'B');
+        if (value >= 1e6) return formatSuffix(value / 1e6, 'M');
+        if (value >= 1e3) return formatSuffix(value / 1e3, 'K');
+        return '$' + Math.round(value);
+    }
+
+    function formatPercentChange(startValue, currentValue) {
+        if (startValue === null || currentValue === null || startValue === 0) return 'n/a';
+        const percent = ((currentValue - startValue) / startValue) * 100;
+        return (percent >= 0 ? '+' : '') + percent.toFixed(1) + '%';
+    }
+
+    function formatMonitorDate(date) {
+        if (!(date instanceof Date)) return 'unknown';
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function getMonitorPanel() {
+        return document.getElementById('dex-mcap-monitor-panel');
+    }
+
+    function updateMonitorPanel() {
+        const panel = getMonitorPanel();
+        if (!panel) return;
+        const list = panel.querySelector('.dex-mcap-monitor-list');
+        const count = panel.querySelector('.dex-mcap-monitor-count');
+        if (!list || !count) return;
+        const monitors = Array.from(mcapMonitors.values());
+        count.textContent = monitors.length + ' active';
+        list.innerHTML = '';
+        if (monitors.length === 0) {
+            list.textContent = 'No active MCap monitors';
+            return;
+        }
+        monitors.forEach(item => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);font-size:12px;color:#ddd;';
+            const labelContainer = document.createElement('div');
+            labelContainer.style.cssText = 'display:flex;flex-direction:column;gap:2px;max-width:130px;';
+            const label = document.createElement('span');
+            label.textContent = item.label;
+            label.style.cssText = 'cursor:pointer;text-decoration:underline;color:#9af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+            label.title = 'Open Dexscreener token page';
+            label.addEventListener('click', () => {
+                window.open('https://dexscreener.com/solana/' + encodeURIComponent(item.pairId), '_blank');
+            });
+            const added = document.createElement('span');
+            added.textContent = 'added ' + formatMonitorDate(item.addedAt);
+            added.style.cssText = 'font-size:10px;color:#999;line-height:1.2;';
+            labelContainer.append(label, added);
+            const status = document.createElement('span');
+            const percentText = formatPercentChange(item.startValue, item.lastValue);
+            status.innerHTML = formatMcapDisplay(item.lastValue) + ' (<span style="color:' + (percentText.startsWith('-') ? '#f56' : '#7cfa8e') + ';">' + percentText + '</span>)';
+            const stop = document.createElement('button');
+            stop.type = 'button';
+            stop.textContent = 'Stop';
+            stop.style.cssText = 'padding:2px 6px;border:none;border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;cursor:pointer;';
+            stop.addEventListener('click', () => {
+                item.observer.disconnect();
+                mcapMonitors.delete(item.pairId);
+                item.button.textContent = 'MCap';
+                item.button.style.opacity = '1';
+                updateMonitorPanel();
+                showToast('Stopped MCap monitor for ' + item.pairId);
+            });
+            row.append(labelContainer, status, stop);
+            list.appendChild(row);
+        });
+    }
+
+    function stopAllMcapMonitors() {
+        mcapMonitors.forEach(item => item.observer.disconnect());
+        mcapMonitors.clear();
+        document.querySelectorAll('button').forEach(btn => {
+            if (btn.textContent === 'MCap ON') {
+                btn.textContent = 'MCap';
+                btn.style.opacity = '1';
+            }
+        });
+        updateMonitorPanel();
+        showToast('Stopped all MCap monitors');
+    }
+
+    function addAllMcapMonitors() {
+        const anchors = Array.from(document.querySelectorAll('a.ds-dex-table-row[href*="/solana/"]'));
+        let count = 0;
+        anchors.forEach(anchor => {
+            const pairId = getPairIdFromHref(anchor.href);
+            if (!pairId || mcapMonitors.has(pairId)) return;
+            const button = anchor.nextElementSibling?.querySelector('button[data-dex-mcap-button="1"]');
+            if (!button) return;
+            startMcapMonitor(pairId, anchor, button, true);
+            count += 1;
+        });
+        showToast(count > 0 ? 'Started ' + count + ' MCap monitors' : 'No new MCap monitors found');
+    }
+
+    function startMcapMonitor(pairId, anchor, button, silent = false) {
+        const existing = mcapMonitors.get(pairId);
+        if (existing) {
+            existing.observer.disconnect();
+            mcapMonitors.delete(pairId);
+            button.textContent = 'MCap';
+            button.style.opacity = '1';
+            updateMonitorPanel();
+            if (!silent) showToast('Stopped MCap monitor');
+            return;
+        }
+
+        const row = getRowFromAnchor(anchor);
+        if (!row) {
+            showInfoPanel('Unable to find row for MCap monitor.', 'error');
+            return;
+        }
+        const cell = getMcapCell(row);
+        if (!cell) {
+            showInfoPanel('Unable to find MCap cell for this row.', 'error');
+            return;
+        }
+        let lastValue = parseMcapValue(cell.textContent);
+        if (lastValue === null) {
+            showInfoPanel('Unable to parse current MCap.', 'error');
+            return;
+        }
+        const label = getTokenLabel(row);
+
+        const observer = new MutationObserver(() => {
+            const newValue = parseMcapValue(cell.textContent);
+            if (newValue === null || newValue === lastValue) return;
+            const item = mcapMonitors.get(pairId);
+            if (item) {
+                item.lastValue = newValue;
+                updateMonitorPanel();
+            }
+            lastValue = newValue;
+        });
+        observer.observe(cell, { childList: true, characterData: true, subtree: true });
+        mcapMonitors.set(pairId, { observer, button, pairId, row, cell, lastValue, startValue: lastValue, label, addedAt: new Date() });
+        button.dataset.dexMcapButton = '1';
+        button.textContent = 'MCap ON';
+        button.style.opacity = '0.9';
+        updateMonitorPanel();
+        showToast('Started MCap monitor');
     }
 
     async function fetchPairInfo(pairId) {
@@ -277,6 +481,8 @@
     }
 
     function insertCopyButton(anchor) {
+        const row = getRowFromAnchor(anchor);
+        if (!row) return;
         const pairId = getPairIdFromHref(anchor.href);
         if (!pairId) return;
         const existing = getCopyWrapper(anchor);
@@ -343,7 +549,18 @@
             openBubble(pairId);
         });
 
-        wrapper.append(copyButton, gmgnButton, xcaButton, xtickerButton, bubbleButton);
+        const mcapButton = document.createElement('button');
+        mcapButton.type = 'button';
+        mcapButton.dataset.dexMcapButton = '1';
+        mcapButton.textContent = 'MCap';
+        mcapButton.style.cssText = 'padding:2px 8px;border:none;border-radius:6px;background:rgba(238,181,12,0.95);color:#111;font-size:11px;cursor:pointer;line-height:1;white-space:nowrap;';
+        mcapButton.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            startMcapMonitor(pairId, anchor, mcapButton);
+        });
+
+        wrapper.append(copyButton, gmgnButton, xcaButton, xtickerButton, bubbleButton, mcapButton);
         anchor.insertAdjacentElement('afterend', wrapper);
     }
 
@@ -351,9 +568,9 @@
         if (document.getElementById('dex-pair-floating-controls')) return;
         const container = document.createElement('div');
         container.id = 'dex-pair-floating-controls';
-        container.style.cssText = 'position:fixed;top:88px;right:16px;z-index:2147483647;display:flex;flex-direction:column;gap:8px;padding:8px;background:rgba(18,18,18,.92);border:1px solid rgba(255,255,255,.1);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.4);font-family:system-ui,sans-serif;';
+        container.style.cssText = 'position:fixed;top:88px;right:16px;z-index:2147483647;display:flex;flex-direction:column;gap:8px;padding:8px;background:rgba(18,18,18,.92);border:1px solid rgba(255,255,255,.1);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.4);font-family:system-ui,sans-serif;width:320px;min-width:260px;min-height:140px;resize:both;overflow:auto;';
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
+        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:move;user-select:none;';
         const title = document.createElement('div');
         title.textContent = 'DEXEnhance';
         title.style.cssText = 'color:#fff;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;';
@@ -362,40 +579,100 @@
         toggleButton.textContent = 'Collapse';
         toggleButton.style.cssText = 'padding:4px 8px;border:none;border-radius:8px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;';
         const buttonGroup = document.createElement('div');
-        buttonGroup.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
-        const contractsButton = document.createElement('button');
-        contractsButton.type = 'button';
-        contractsButton.textContent = 'Copy all pair CAs';
+        buttonGroup.style.cssText = 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;';
+        const dipButton = document.createElement('button');
+        dipButton.type = 'button';
+        dipButton.textContent = 'Dip Only';
+        const rangeButton = document.createElement('button');
+        rangeButton.type = 'button';
+        rangeButton.textContent = '20-100K';
         const tokensButton = document.createElement('button');
         tokensButton.type = 'button';
-        tokensButton.textContent = 'Copy all token CAs';
+        tokensButton.textContent = 'Copy token CAs';
         const openAllButton = document.createElement('button');
         openAllButton.type = 'button';
-        openAllButton.textContent = 'Open all Dexscreener tabs';
-        [contractsButton, tokensButton, openAllButton].forEach(btn => {
-            btn.style.cssText = 'padding:8px 10px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:13px;cursor:pointer;';
+        openAllButton.textContent = 'Open tabs';
+        [dipButton, rangeButton, tokensButton, openAllButton].forEach(btn => {
+            btn.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
             btn.addEventListener('mouseenter', () => btn.style.background = '#2ac6b3');
             btn.addEventListener('mouseleave', () => btn.style.background = '#26a69a');
         });
-        contractsButton.addEventListener('click', () => copyPairs('contracts'));
+        dipButton.addEventListener('click', () => {
+            window.location.href = 'https://dexscreener.com/new-pairs/solana?rankBy=pairAge&order=asc&dexIds=pumpswap&minLiq=7000&minMarketCap=17000&maxMarketCap=120000&minAge=1&maxAge=168&min6HVol=2000&min1HVol=500&max24HChg=-1&max6HChg=-1&max1HChg=-1&profile=1';
+        });
+        rangeButton.addEventListener('click', () => {
+            window.location.href = 'https://dexscreener.com/new-pairs/solana?rankBy=pairAge&order=asc&dexIds=pumpswap,pumpfun&minLiq=5000&minMarketCap=20000&maxMarketCap=100000&minAge=1&maxAge=168&min6HVol=3333&min1HVol=333&profile=1&launchpads=1';
+        });
         tokensButton.addEventListener('click', () => copyPairs('tokens'));
         openAllButton.addEventListener('click', () => openAllDexscreenerTabs());
+        const monitorAllButton = document.createElement('button');
+        monitorAllButton.type = 'button';
+        monitorAllButton.textContent = 'Monitor all';
+        monitorAllButton.style.cssText = 'padding:6px 8px;border:none;border-radius:8px;background:#26a69a;color:#111;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        monitorAllButton.addEventListener('mouseenter', () => monitorAllButton.style.background = '#2ac6b3');
+        monitorAllButton.addEventListener('mouseleave', () => monitorAllButton.style.background = '#26a69a');
+        monitorAllButton.addEventListener('click', addAllMcapMonitors);
         toggleButton.addEventListener('click', () => {
             const collapsed = container.dataset.collapsed === '1';
             container.dataset.collapsed = collapsed ? '0' : '1';
             buttonGroup.style.display = collapsed ? 'flex' : 'none';
+            monitorPanel.style.display = collapsed ? 'block' : 'none';
             toggleButton.textContent = collapsed ? 'Collapse' : 'Expand';
             container.style.width = collapsed ? '' : 'auto';
         });
+        const monitorPanel = document.createElement('div');
+        monitorPanel.id = 'dex-mcap-monitor-panel';
+        monitorPanel.style.cssText = 'border-top:1px solid rgba(255,255,255,.1);padding-top:8px;margin-top:8px;display:flex;flex-direction:column;overflow:auto;max-height:calc(100vh - 220px);';
+        monitorPanel.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:12px;color:#fff;">' +
+            '<span><strong>MCap monitors</strong> <span class="dex-mcap-monitor-count">0 active</span></span>' +
+            '<button id="dex-mcap-stop-all" style="padding:4px 8px;border:none;border-radius:8px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;">Stop all</button>' +
+            '</div>' +
+            '<div class="dex-mcap-monitor-list" style="overflow:auto;color:#ddd;font-size:12px;min-height:40px;"></div>';
         header.append(title, toggleButton);
-        buttonGroup.append(contractsButton, tokensButton, openAllButton);
-        container.append(header, buttonGroup);
+        buttonGroup.append(dipButton, rangeButton, tokensButton, openAllButton, monitorAllButton);
+        container.append(header, buttonGroup, monitorPanel);
         document.body.appendChild(container);
+
+        let dragState = null;
+        header.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            const rect = container.getBoundingClientRect();
+            dragState = {
+                startX: event.clientX,
+                startY: event.clientY,
+                origLeft: rect.left,
+                origTop: rect.top
+            };
+            container.style.left = rect.left + 'px';
+            container.style.top = rect.top + 'px';
+            container.style.right = 'auto';
+            container.style.bottom = 'auto';
+            container.setPointerCapture(event.pointerId);
+            event.preventDefault();
+        });
+        header.addEventListener('pointermove', event => {
+            if (!dragState) return;
+            const dx = event.clientX - dragState.startX;
+            const dy = event.clientY - dragState.startY;
+            container.style.left = dragState.origLeft + dx + 'px';
+            container.style.top = dragState.origTop + dy + 'px';
+        });
+        header.addEventListener('pointerup', event => {
+            if (!dragState) return;
+            dragState = null;
+            container.releasePointerCapture(event.pointerId);
+        });
+        header.addEventListener('pointercancel', () => {
+            dragState = null;
+        });
+
+        document.getElementById('dex-mcap-stop-all').addEventListener('click', stopAllMcapMonitors);
+        updateMonitorPanel();
     }
 
     function scanDexscreenerLinks() {
         cleanupCopyWrappers();
-        const anchors = document.querySelectorAll('a[href*="/solana/"]');
+        const anchors = document.querySelectorAll('a.ds-dex-table-row[href*="/solana/"]');
         anchors.forEach(insertCopyButton);
     }
 
