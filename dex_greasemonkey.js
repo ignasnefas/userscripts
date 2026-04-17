@@ -71,48 +71,69 @@
     const mcapMonitors = new Map();
     const monitorStorageKey = 'dex-enhance-mcap-monitors';
     let monitorSortDescending = true;
+    let mcapMonitorPollHandle = null;
 
     function loadStoredMonitors() {
         try {
             const raw = localStorage.getItem(monitorStorageKey);
-            return raw ? JSON.parse(raw) : [];
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                return parsed.reduce((acc, pairId) => {
+                    if (typeof pairId === 'string') acc[pairId] = {};
+                    return acc;
+                }, {});
+            }
+            if (parsed && typeof parsed === 'object') {
+                return parsed;
+            }
+            return {};
         } catch (e) {
             console.warn('Failed to load stored monitors', e);
-            return [];
+            return {};
         }
     }
 
-    function saveStoredMonitors(ids) {
+    function saveStoredMonitors(monitors) {
         try {
-            localStorage.setItem(monitorStorageKey, JSON.stringify(Array.from(new Set(ids))));
+            localStorage.setItem(monitorStorageKey, JSON.stringify(monitors));
         } catch (e) {
             console.warn('Failed to save stored monitors', e);
         }
     }
 
-    function addMonitorToStorage(pairId) {
-        const stored = new Set(loadStoredMonitors());
-        stored.add(pairId);
-        saveStoredMonitors(Array.from(stored));
+    function addMonitorToStorage(pairId, startValue, addedAt, addedMcap) {
+        const stored = loadStoredMonitors();
+        stored[pairId] = {
+            startValue: typeof startValue === 'number' ? startValue : stored[pairId]?.startValue || null,
+            addedAt: addedAt ? addedAt.toISOString() : stored[pairId]?.addedAt || new Date().toISOString(),
+            addedMcap: typeof addedMcap === 'number' ? addedMcap : stored[pairId]?.addedMcap || null
+        };
+        saveStoredMonitors(stored);
     }
 
     function removeMonitorFromStorage(pairId) {
-        const stored = new Set(loadStoredMonitors());
-        stored.delete(pairId);
-        saveStoredMonitors(Array.from(stored));
+        const stored = loadStoredMonitors();
+        delete stored[pairId];
+        saveStoredMonitors(stored);
     }
 
     function restoreMonitors() {
         const stored = loadStoredMonitors();
-        if (!stored.length) return;
+        const keys = Object.keys(stored);
+        if (!keys.length) return;
         const anchors = Array.from(document.querySelectorAll('a.ds-dex-table-row[href*="/solana/"]'));
-        stored.forEach(pairId => {
+        keys.forEach(pairId => {
             if (mcapMonitors.has(pairId)) return;
             const anchor = anchors.find(a => getPairIdFromHref(a.href) === pairId);
             if (!anchor) return;
             const button = anchor.nextElementSibling?.querySelector('button[data-dex-mcap-button="1"]');
             if (!button) return;
-            startMcapMonitor(pairId, anchor, button, true);
+            const storedData = stored[pairId] || {};
+            const startValue = typeof storedData.startValue === 'number' ? storedData.startValue : null;
+            const addedAt = storedData.addedAt ? new Date(storedData.addedAt) : null;
+            const addedMcap = typeof storedData.addedMcap === 'number' ? storedData.addedMcap : null;
+            startMcapMonitor(pairId, anchor, button, true, startValue, addedAt, addedMcap);
         });
     }
 
@@ -153,6 +174,16 @@
 
     function getRowFromAnchor(anchor) {
         return anchor.closest('a.ds-dex-table-row');
+    }
+
+    function findMcapRowForPair(pairId) {
+        const anchors = Array.from(document.querySelectorAll('a[href*="/solana/"]'));
+        const anchor = anchors.find(a => getPairIdFromHref(a.href) === pairId);
+        if (!anchor) return null;
+        const row = getRowFromAnchor(anchor);
+        if (!row) return null;
+        const cell = getMcapCell(row);
+        return cell ? { row, cell } : null;
     }
 
     function getTokenLabel(row) {
@@ -252,7 +283,7 @@
                 window.open('https://dexscreener.com/solana/' + encodeURIComponent(item.pairId), '_blank');
             });
             const added = document.createElement('span');
-            added.textContent = 'added ' + formatMonitorDate(item.addedAt) + ' (' + formatMonitorAge(item.addedAt) + ')';
+            added.textContent = 'added ' + formatMonitorDate(item.addedAt) + ' (' + formatMonitorAge(item.addedAt) + ') @ ' + formatMcapDisplay(item.addedMcap);
             added.style.cssText = 'font-size:10px;color:#999;line-height:1.2;';
             labelContainer.append(label, added);
             const status = document.createElement('span');
@@ -267,6 +298,7 @@
                 item.observer.disconnect();
                 mcapMonitors.delete(item.pairId);
                 removeMonitorFromStorage(item.pairId);
+                if (mcapMonitors.size === 0) stopMcapPolling();
                 item.button.textContent = 'Monitor';
                 item.button.style.opacity = '1';
                 updateMonitorPanel();
@@ -277,10 +309,38 @@
         });
     }
 
+    function stopMcapPolling() {
+        if (mcapMonitorPollHandle !== null) {
+            clearInterval(mcapMonitorPollHandle);
+            mcapMonitorPollHandle = null;
+        }
+    }
+
+    function startMcapPolling() {
+        if (mcapMonitorPollHandle !== null) return;
+        mcapMonitorPollHandle = setInterval(() => {
+            mcapMonitors.forEach(item => {
+                if (!document.body.contains(item.row)) {
+                    const fallback = findMcapRowForPair(item.pairId);
+                    if (!fallback) return;
+                    item.row = fallback.row;
+                    item.cell = fallback.cell;
+                }
+                const currentCell = item.cell || getMcapCell(item.row);
+                if (!currentCell) return;
+                const newValue = parseMcapValue(currentCell.textContent);
+                if (newValue === null || newValue === item.lastValue) return;
+                item.lastValue = newValue;
+                updateMonitorPanel();
+            });
+        }, 2000);
+    }
+
     function stopAllMcapMonitors() {
         mcapMonitors.forEach(item => item.observer.disconnect());
         mcapMonitors.clear();
-        saveStoredMonitors([]);
+        stopMcapPolling();
+        saveStoredMonitors({});
         document.querySelectorAll('button').forEach(btn => {
             if (btn.textContent === 'Monitoring') {
                 btn.textContent = 'Monitor';
@@ -305,7 +365,7 @@
         showToast(count > 0 ? 'Started ' + count + ' MCap monitors' : 'No new MCap monitors found');
     }
 
-    function startMcapMonitor(pairId, anchor, button, silent = false) {
+    function startMcapMonitor(pairId, anchor, button, silent = false, persistedStartValue = null, persistedAddedAt = null, persistedAddedMcap = null) {
         const existing = mcapMonitors.get(pairId);
         if (existing) {
             existing.observer.disconnect();
@@ -328,31 +388,51 @@
             showInfoPanel('Unable to find MCap cell for this row.', 'error');
             return;
         }
-        let lastValue = parseMcapValue(cell.textContent);
-        if (lastValue === null) {
+        const currentValue = parseMcapValue(cell.textContent);
+        if (currentValue === null) {
             showInfoPanel('Unable to parse current MCap.', 'error');
             return;
         }
+        const startValue = typeof persistedStartValue === 'number' && persistedStartValue > 0 ? persistedStartValue : currentValue;
+        const addedAt = persistedAddedAt instanceof Date && !Number.isNaN(persistedAddedAt.getTime()) ? persistedAddedAt : new Date();
+        const addedMcap = typeof persistedAddedMcap === 'number' && persistedAddedMcap > 0 ? persistedAddedMcap : currentValue;
         const label = getTokenLabel(row);
 
-        const observer = new MutationObserver(() => {
-            const newValue = parseMcapValue(cell.textContent);
-            if (newValue === null || newValue === lastValue) return;
-            const item = mcapMonitors.get(pairId);
-            if (item) {
-                item.lastValue = newValue;
-                updateMonitorPanel();
+        let lastValue = currentValue;
+        let currentRow = row;
+        let currentCell = cell;
+        const item = { observer: null, button, pairId, row: currentRow, cell: currentCell, lastValue, startValue, label, addedAt, addedMcap };
+        const ensureRowAndCell = () => {
+            if (currentCell && currentRow && document.body.contains(currentRow)) {
+                return true;
             }
+            const fallback = findMcapRowForPair(pairId);
+            if (!fallback) return false;
+            currentRow = fallback.row;
+            currentCell = fallback.cell;
+            item.row = currentRow;
+            item.cell = currentCell;
+            return true;
+        };
+        const handleValueChange = () => {
+            if (!ensureRowAndCell()) return;
+            const newValue = parseMcapValue(currentCell.textContent);
+            if (newValue === null || newValue === lastValue) return;
+            item.lastValue = newValue;
+            updateMonitorPanel();
             lastValue = newValue;
-        });
-        observer.observe(cell, { childList: true, characterData: true, subtree: true });
-        mcapMonitors.set(pairId, { observer, button, pairId, row, cell, lastValue, startValue: lastValue, label, addedAt: new Date() });
-        addMonitorToStorage(pairId);
+        };
+        const observer = new MutationObserver(handleValueChange);
+        observer.observe(currentRow, { childList: true, characterData: true, subtree: true, attributes: true });
+        item.observer = observer;
+        mcapMonitors.set(pairId, item);
+        addMonitorToStorage(pairId, startValue, addedAt, addedMcap);
+        startMcapPolling();
         button.dataset.dexMcapButton = '1';
         button.textContent = 'Monitoring';
         button.style.opacity = '0.9';
         updateMonitorPanel();
-        showToast('Started MCap monitor');
+        if (!silent) showToast('Started MCap monitor');
     }
 
     async function fetchPairInfo(pairId) {
